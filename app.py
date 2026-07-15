@@ -1,21 +1,18 @@
 """
-Client Reports Automation - Microservice v2
+Client Reports Automation - Microservice v3
 ============================================
 
-Flask microservice that generates .pptx reports from templates by:
-1. Replacing {{placeholder}} text tags with actual data
-2. Replacing images on specified slides with chart images from URLs
-   (preserving aspect ratio, centering within the target box)
+Flask microservice that generates .pptx reports from templates.
+Reads PNG dimensions directly from binary bytes (no Pillow dependency).
 
 Endpoints:
 - GET  /          : health check
 - POST /generate  : generate a report from JSON body
-
-Deployed on Render.com free tier.
 """
 from flask import Flask, request, send_file, jsonify
 from pptx import Presentation
 import requests
+import struct
 import io
 import os
 import traceback
@@ -55,7 +52,6 @@ def replace_placeholders_in_paragraph(paragraph, placeholders):
 
 
 def replace_in_shape(shape, placeholders):
-    """Recursively process a shape for text replacement."""
     if shape.has_text_frame:
         for para in shape.text_frame.paragraphs:
             replace_placeholders_in_paragraph(para, placeholders)
@@ -75,18 +71,31 @@ def replace_in_shape(shape, placeholders):
 
 
 # ==========================================
-# IMAGE REPLACEMENT (with aspect ratio preservation)
+# IMAGE DIMENSIONS (PNG only, no Pillow needed)
 # ==========================================
 
-def get_image_dimensions(image_bytes):
-    """Get (width, height) in pixels from image bytes."""
-    from PIL import Image
+def get_png_dimensions(image_bytes):
+    """
+    Read width and height from PNG file header.
+    Returns (width, height) in pixels or None if not a valid PNG.
+    """
+    if len(image_bytes) < 24:
+        return None
+    # PNG signature is 8 bytes: \x89 P N G \r \n \x1a \n
+    if image_bytes[:8] != b'\x89PNG\r\n\x1a\n':
+        return None
+    # IHDR chunk: width at offset 16-19, height at offset 20-23 (big-endian uint32)
     try:
-        img = Image.open(io.BytesIO(image_bytes))
-        return img.size
+        width = struct.unpack('>I', image_bytes[16:20])[0]
+        height = struct.unpack('>I', image_bytes[20:24])[0]
+        return (width, height)
     except Exception:
         return None
 
+
+# ==========================================
+# IMAGE REPLACEMENT (aspect ratio preserved)
+# ==========================================
 
 def replace_image_on_slide(slide, image_bytes, image_index=0):
     """
@@ -109,8 +118,9 @@ def replace_image_on_slide(slide, image_bytes, image_index=0):
     sp = target._element
     sp.getparent().remove(sp)
 
-    dims = get_image_dimensions(image_bytes)
+    dims = get_png_dimensions(image_bytes)
     if dims is None:
+        # Not a PNG or can't read — fallback: fill the target box
         slide.shapes.add_picture(io.BytesIO(image_bytes), box_left, box_top, box_width, box_height)
         return True
 
@@ -119,9 +129,11 @@ def replace_image_on_slide(slide, image_bytes, image_index=0):
     box_ratio = box_width / box_height if box_height > 0 else 1
 
     if img_ratio > box_ratio:
+        # Image wider than box → fit width, reduce height
         new_width = box_width
         new_height = int(box_width / img_ratio)
     else:
+        # Image taller/narrower than box → fit height, reduce width
         new_height = box_height
         new_width = int(box_height * img_ratio)
 
