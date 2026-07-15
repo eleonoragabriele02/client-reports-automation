@@ -1,10 +1,11 @@
 """
-Client Reports Automation - Microservice
-========================================
+Client Reports Automation - Microservice v2
+============================================
 
 Flask microservice that generates .pptx reports from templates by:
 1. Replacing {{placeholder}} text tags with actual data
 2. Replacing images on specified slides with chart images from URLs
+   (preserving aspect ratio, centering within the target box)
 
 Endpoints:
 - GET  /          : health check
@@ -22,7 +23,7 @@ import traceback
 app = Flask(__name__)
 
 TEMPLATES_DIR = os.path.dirname(os.path.abspath(__file__))
-REQUEST_TIMEOUT = 30  # seconds for image download
+REQUEST_TIMEOUT = 30
 
 
 # ==========================================
@@ -30,11 +31,7 @@ REQUEST_TIMEOUT = 30  # seconds for image download
 # ==========================================
 
 def replace_placeholders_in_paragraph(paragraph, placeholders):
-    """
-    Replace {{placeholder}} tags in a paragraph, handling text runs
-    that may be fragmented across multiple <a:r> elements in the XML.
-    """
-    # Concatenate all runs to get the full paragraph text
+    """Handle placeholders that span multiple runs by consolidating them."""
     full_text = ''.join(run.text for run in paragraph.runs)
     if '{{' not in full_text:
         return False
@@ -49,7 +46,6 @@ def replace_placeholders_in_paragraph(paragraph, placeholders):
     if new_text == full_text:
         return False
 
-    # Consolidate: put all new text in first run, clear others
     if paragraph.runs:
         paragraph.runs[0].text = new_text
         for run in paragraph.runs[1:]:
@@ -60,19 +56,16 @@ def replace_placeholders_in_paragraph(paragraph, placeholders):
 
 def replace_in_shape(shape, placeholders):
     """Recursively process a shape for text replacement."""
-    # Regular text frames
     if shape.has_text_frame:
         for para in shape.text_frame.paragraphs:
             replace_placeholders_in_paragraph(para, placeholders)
 
-    # Table cells
     if shape.has_table:
         for row in shape.table.rows:
             for cell in row.cells:
                 for para in cell.text_frame.paragraphs:
                     replace_placeholders_in_paragraph(para, placeholders)
 
-    # Groups - recurse into sub-shapes
     try:
         if shape.shape_type == 6:  # GROUP
             for sub_shape in shape.shapes:
@@ -82,34 +75,60 @@ def replace_in_shape(shape, placeholders):
 
 
 # ==========================================
-# IMAGE REPLACEMENT
+# IMAGE REPLACEMENT (with aspect ratio preservation)
 # ==========================================
+
+def get_image_dimensions(image_bytes):
+    """Get (width, height) in pixels from image bytes."""
+    from PIL import Image
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        return img.size
+    except Exception:
+        return None
+
 
 def replace_image_on_slide(slide, image_bytes, image_index=0):
     """
-    Replace the Nth largest picture on a slide by removing it and
-    adding a new picture at the same position/size.
+    Replace the Nth largest picture on a slide.
+    Preserves the new image's aspect ratio and centers it within the target box.
     """
-    pictures = [s for s in slide.shapes if s.shape_type == 13]  # PICTURE = 13
+    pictures = [s for s in slide.shapes if s.shape_type == 13]
     if not pictures:
         return False
 
-    # Sort by area descending (largest first — the chart image is typically the biggest)
     pictures.sort(key=lambda p: (p.width or 0) * (p.height or 0), reverse=True)
 
     if image_index >= len(pictures):
         return False
 
     target = pictures[image_index]
-    left, top = target.left, target.top
-    width, height = target.width, target.height
+    box_left, box_top = target.left, target.top
+    box_width, box_height = target.width, target.height
 
-    # Remove old picture from slide XML
     sp = target._element
     sp.getparent().remove(sp)
 
-    # Add new picture at same position/size
-    slide.shapes.add_picture(io.BytesIO(image_bytes), left, top, width, height)
+    dims = get_image_dimensions(image_bytes)
+    if dims is None:
+        slide.shapes.add_picture(io.BytesIO(image_bytes), box_left, box_top, box_width, box_height)
+        return True
+
+    img_w_px, img_h_px = dims
+    img_ratio = img_w_px / img_h_px if img_h_px > 0 else 1
+    box_ratio = box_width / box_height if box_height > 0 else 1
+
+    if img_ratio > box_ratio:
+        new_width = box_width
+        new_height = int(box_width / img_ratio)
+    else:
+        new_height = box_height
+        new_width = int(box_height * img_ratio)
+
+    new_left = box_left + (box_width - new_width) // 2
+    new_top = box_top + (box_height - new_height) // 2
+
+    slide.shapes.add_picture(io.BytesIO(image_bytes), new_left, new_top, new_width, new_height)
     return True
 
 
@@ -119,7 +138,6 @@ def replace_image_on_slide(slide, image_bytes, image_index=0):
 
 @app.route('/', methods=['GET'])
 def health():
-    """Health check endpoint. Also lists available templates."""
     templates = [f for f in os.listdir(TEMPLATES_DIR) if f.endswith('.pptx')]
     return jsonify({
         'status': 'ok',
@@ -131,23 +149,6 @@ def health():
 
 @app.route('/generate', methods=['POST'])
 def generate_report():
-    """
-    Generate a pptx report from template + data.
-
-    Request body (JSON):
-    {
-        "template": "Malne-Template.pptx",
-        "placeholders": {
-            "tra_web_curr": "27.729",
-            "comentario_trafico": "...",
-            ...
-        },
-        "images": {
-            "5": "https://quickchart.io/chart?...",
-            "6": "https://quickchart.io/chart?..."
-        }
-    }
-    """
     try:
         data = request.get_json(force=True, silent=False)
         if not data:
@@ -157,7 +158,6 @@ def generate_report():
         placeholders = data.get('placeholders', {})
         images = data.get('images', {})
 
-        # Validate template exists
         template_path = os.path.join(TEMPLATES_DIR, template_name)
         if not os.path.exists(template_path):
             available = [f for f in os.listdir(TEMPLATES_DIR) if f.endswith('.pptx')]
@@ -166,15 +166,12 @@ def generate_report():
                 'available': available
             }), 404
 
-        # Load template
         prs = Presentation(template_path)
 
-        # Replace text placeholders across all slides
         for slide in prs.slides:
             for shape in slide.shapes:
                 replace_in_shape(shape, placeholders)
 
-        # Replace images on specified slides
         images_replaced = 0
         for slide_num_str, image_url in images.items():
             try:
@@ -200,12 +197,10 @@ def generate_report():
                 print(f'[ERROR] Image replacement slide {slide_num_str}: {e}')
                 continue
 
-        # Save to memory buffer
         output = io.BytesIO()
         prs.save(output)
         output.seek(0)
 
-        # Build filename
         template_base = os.path.splitext(template_name)[0]
         filename = f'{template_base}-generated.pptx'
 
